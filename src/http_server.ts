@@ -6,8 +6,21 @@ import { readerFromMemory } from "./body_readers.js";
 import { cutMessage, readerFromReq } from "./http_parser.js";
 import { writeHTTPResp } from "./http_response.js";
 import { handleReq } from "./handlers.js";
+import {
+  HttpPipeline,
+  corsMiddleware,
+  loggerMiddleware,
+  rateLimitMiddleware,
+} from "./middleware.js";
 import { soInit, soRead } from "./tcp.js";
 import { runWebSocketSession } from "./websocket.js";
+
+const httpPipeline = new HttpPipeline()
+  .use(loggerMiddleware)
+  .use(corsMiddleware)
+  .use(rateLimitMiddleware);
+
+const handleHttp = httpPipeline.finalize(handleReq);
 
 async function serveClient(conn: TCPConn): Promise<void> {
   const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
@@ -23,7 +36,7 @@ async function serveClient(conn: TCPConn): Promise<void> {
     }
 
     const reqBody = readerFromReq(conn, buf, msg);
-    const res = await handleReq(msg, reqBody);
+    const res = await handleHttp(msg, reqBody);
     await writeHTTPResp(conn, res);
 
     if (res.code === 101) {
