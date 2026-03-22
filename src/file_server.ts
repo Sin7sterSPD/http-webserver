@@ -36,7 +36,7 @@ const MIME: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 
-function mimeFromPath(filePath: string): string {
+export function mimeFromPath(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   return MIME[ext] ?? "application/octet-stream";
 }
@@ -54,7 +54,7 @@ export function urlPathname(uri: Buffer): string {
   return path.posix.normalize(p);
 }
 
-function resolveSafe(filesRoot: string, urlPath: string): string {
+export function resolveSafe(filesRoot: string, urlPath: string): string {
   const rel = urlPath.replace(/^\/+/, "");
   const candidate = path.resolve(filesRoot, rel);
   const root = path.resolve(filesRoot);
