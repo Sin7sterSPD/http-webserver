@@ -6,7 +6,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "tsx src/server.ts",
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "serve": "tsx src/http_server.ts",
+    "dev:web": "tsx watch src/http_server.ts",
+    "http": "tsx src/http.ts"
   },
   "keywords": [],
   "author": "",
