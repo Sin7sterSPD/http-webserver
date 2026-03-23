@@ -12,6 +12,7 @@ function statusReason(code: number): string {
     405: "Method Not Allowed",
     413: "Payload Too Large",
     416: "Range Not Satisfiable",
+    429: "Too Many Requests",
     500: "Internal Server Error",
   };
   return m[code] ?? "OK";

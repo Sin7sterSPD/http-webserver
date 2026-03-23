@@ -12,6 +12,7 @@ import {
   loggerMiddleware,
   rateLimitMiddleware,
 } from "./middleware.js";
+import { normalizeClientIp } from "./rate_limit.js";
 import { soInit, soRead } from "./tcp.js";
 import { runWebSocketSession } from "./websocket.js";
 
@@ -36,7 +37,9 @@ async function serveClient(conn: TCPConn): Promise<void> {
     }
 
     const reqBody = readerFromReq(conn, buf, msg);
-    const res = await handleHttp(msg, reqBody);
+    const res = await handleHttp(msg, reqBody, {
+      clientIp: normalizeClientIp(conn.socket.remoteAddress),
+    });
     await writeHTTPResp(conn, res);
 
     if (res.code === 101) {
