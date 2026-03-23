@@ -23,7 +23,7 @@ export type NextFn = () => Promise<void>;
 export type Middleware = (
   req: HTTPReq,
   res: MiddlewareRes,
-  next: NextFn
+  next: NextFn,
 ) => Promise<void>;
 
 /** Options passed from the TCP layer into the pipeline. */
@@ -33,16 +33,16 @@ export type HttpPipelineRunOptions = {
 
 function compose(
   stack: Middleware[],
-  handler: (req: HTTPReq, body: BodyReader) => Promise<HTTPRes>
+  handler: (req: HTTPReq, body: BodyReader) => Promise<HTTPRes>,
 ): (
   req: HTTPReq,
   body: BodyReader,
-  opts: HttpPipelineRunOptions
+  opts: HttpPipelineRunOptions,
 ) => Promise<HTTPRes> {
   return async (
     req: HTTPReq,
     body: BodyReader,
-    opts: HttpPipelineRunOptions
+    opts: HttpPipelineRunOptions,
   ): Promise<HTTPRes> => {
     const res: MiddlewareRes = {
       body,
@@ -65,7 +65,9 @@ function compose(
 
     await dispatch(0);
     if (!res.response) {
-      throw new Error("Middleware pipeline finished without setting res.response");
+      throw new Error(
+        "Middleware pipeline finished without setting res.response",
+      );
     }
     return res.response;
   };
@@ -87,8 +89,12 @@ export class HttpPipeline {
    * Produces `(req, body, opts) => Promise<HTTPRes>` for `http_server` / your TCP loop.
    */
   finalize(
-    handler: (req: HTTPReq, body: BodyReader) => Promise<HTTPRes>
-  ): (req: HTTPReq, body: BodyReader, opts: HttpPipelineRunOptions) => Promise<HTTPRes> {
+    handler: (req: HTTPReq, body: BodyReader) => Promise<HTTPRes>,
+  ): (
+    req: HTTPReq,
+    body: BodyReader,
+    opts: HttpPipelineRunOptions,
+  ) => Promise<HTTPRes> {
     return compose(this.stack.slice(), handler);
   }
 }
@@ -105,7 +111,7 @@ function formatSizeKb(bodyLength: number): string {
 export async function loggerMiddleware(
   req: HTTPReq,
   res: MiddlewareRes,
-  next: NextFn
+  next: NextFn,
 ): Promise<void> {
   const start = performance.now();
   const path = urlPathname(req.uri);
@@ -124,7 +130,7 @@ export async function loggerMiddleware(
 export async function corsMiddleware(
   _req: HTTPReq,
   res: MiddlewareRes,
-  next: NextFn
+  next: NextFn,
 ): Promise<void> {
   await next();
   if (res.response) {
@@ -133,7 +139,7 @@ export async function corsMiddleware(
 }
 
 export function createRateLimitMiddleware(
-  limiter: TokenBucketRateLimiter
+  limiter: TokenBucketRateLimiter,
 ): Middleware {
   return async (_req, res, next) => {
     const result = limiter.tryConsume(res.clientIp, Date.now());
@@ -142,6 +148,7 @@ export function createRateLimitMiddleware(
         code: 429,
         headers: [
           Buffer.from("Server: http-web-server"),
+          Buffer.from("Content-Type: text/plain"),
           Buffer.from(`Retry-After: ${result.retryAfterSec}`),
         ],
         body: readerFromMemory(Buffer.from("Too Many Requests\n")),
@@ -155,4 +162,5 @@ export function createRateLimitMiddleware(
 /** Shared limiter for the default pipeline in `http_server.ts`. */
 const defaultRateLimiter = new TokenBucketRateLimiter();
 
-export const rateLimitMiddleware = createRateLimitMiddleware(defaultRateLimiter);
+export const rateLimitMiddleware =
+  createRateLimitMiddleware(defaultRateLimiter);

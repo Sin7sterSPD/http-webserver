@@ -5,6 +5,18 @@ export const TOKEN_BUCKET_REFILL_PER_SEC = 10;
 /** Tokens consumed per HTTP request. */
 export const TOKEN_BUCKET_COST = 1;
 
+/**
+ * Idle time after which a bucket is at CAPACITY in the mathematical model (empty → full
+ * takes CAPACITY/REFILL seconds). Evicting then only drops redundant state; active clients
+ * touch lastMs often and are never removed. Under high traffic, eviction is rare O(n) work
+ * amortized over EVICT_EVERY tryConsume calls; the hot path stays Map get + arithmetic.
+ */
+export const STALE_IDLE_MS =
+  (TOKEN_BUCKET_CAPACITY / TOKEN_BUCKET_REFILL_PER_SEC) * 1000;
+
+/** How often tryConsume triggers a lazy sweep (power of two for cheap bitmask). */
+const EVICT_EVERY = 256;
+
 type BucketState = {
   tokens: number;
   lastMs: number;
@@ -12,6 +24,20 @@ type BucketState = {
 
 export class TokenBucketRateLimiter {
   private readonly buckets = new Map<string, BucketState>();
+  private tryConsumeCount = 0;
+
+  /**
+   * Remove buckets whose last use was long enough ago that they would already be full
+   * if simulated forward — safe to drop and recreate on next hit as a fresh bucket.
+   */
+  evictStale(nowMs: number): void {
+    const cutoff = nowMs - STALE_IDLE_MS;
+    for (const [ip, state] of this.buckets) {
+      if (state.lastMs < cutoff) {
+        this.buckets.delete(ip);
+      }
+    }
+  }
 
   /**
    * Attempt to consume one token for `ip`. Updates bucket state.
@@ -21,6 +47,10 @@ export class TokenBucketRateLimiter {
     ip: string,
     nowMs: number
   ): { ok: true } | { ok: false; retryAfterSec: number } {
+    if ((++this.tryConsumeCount & (EVICT_EVERY - 1)) === 0) {
+      this.evictStale(nowMs);
+    }
+
     let b = this.buckets.get(ip);
     if (!b) {
       b = { tokens: TOKEN_BUCKET_CAPACITY, lastMs: nowMs };
@@ -51,7 +81,12 @@ export class TokenBucketRateLimiter {
 
 /** Collapse IPv4-mapped IPv6 so one client maps to one bucket key. */
 export function normalizeClientIp(addr: string | undefined): string {
-  if (!addr) return "unknown";
+  if (!addr) {
+    console.warn(
+      "remoteAddress is undefined; rate-limiting will not work correctly"
+    );
+    return "unknown";
+  }
   if (addr.startsWith("::ffff:")) return addr.slice("::ffff:".length);
   return addr;
 }
