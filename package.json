@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run check",
+    "check": "tsc --noEmit",
     "start": "tsx src/server.ts",
     "dev": "tsx watch src/server.ts",
     "serve": "tsx src/http_server.ts",
@@ -19,5 +20,8 @@
     "@types/node": "^24.10.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }

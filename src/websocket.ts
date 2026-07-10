@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
 import type { DynBuf, HTTPReq, HTTPRes, TCPConn } from "./http_types.js";
+import type {
+  WebSocketConnection,
+  WebSocketRouteSession,
+} from "./framework/types.js";
 import { bufPop, bufPush } from "./buffer.js";
 import { fieldGet } from "./http_parser.js";
 import { readerFromMemory } from "./body_readers.js";
@@ -114,15 +118,32 @@ async function readWsFrame(
   return { opcode, payload };
 }
 
-export async function runWebSocketSession(conn: TCPConn): Promise<void> {
+function createWebSocketConnection(conn: TCPConn): WebSocketConnection {
+  return {
+    send: async (data) => {
+      const payload = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+      const opcode = typeof data === "string" ? 0x1 : 0x2;
+      await soWrite(conn, encodeWsFrame(opcode, payload));
+    },
+    close: async () => {
+      await soWrite(conn, encodeWsFrame(0x8, Buffer.alloc(0))).catch(() => {});
+      conn.socket.end();
+    },
+  };
+}
+
+export async function runWebSocketSession(
+  conn: TCPConn,
+  session?: WebSocketRouteSession,
+): Promise<void> {
   const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
-  await soWrite(
-    conn,
-    encodeWsFrame(
-      0x1,
-      Buffer.from("Welcome! Send text; server echoes.\n", "utf8")
-    )
-  );
+  const ws = createWebSocketConnection(conn);
+
+  if (session) {
+    await session.open?.(ws);
+  } else {
+    await ws.send("Welcome! Send text; server echoes.\n");
+  }
 
   while (true) {
     let frame: { opcode: number; payload: Buffer };
@@ -133,10 +154,7 @@ export async function runWebSocketSession(conn: TCPConn): Promise<void> {
     }
     const { opcode, payload } = frame;
     if (opcode === 0x8) {
-      await soWrite(
-        conn,
-        encodeWsFrame(0x8, Buffer.alloc(0))
-      ).catch(() => {});
+      await soWrite(conn, encodeWsFrame(0x8, Buffer.alloc(0))).catch(() => {});
       break;
     }
     if (opcode === 0x9) {
@@ -145,13 +163,17 @@ export async function runWebSocketSession(conn: TCPConn): Promise<void> {
     }
     if (opcode === 0xa) continue;
     if (opcode === 0x1 || opcode === 0x2) {
-      const label =
-        opcode === 0x1 ? payload.toString("utf8") : `[binary ${payload.length}b]`;
-      const reply = `Echo: ${label}\n`;
-      await soWrite(conn, encodeWsFrame(0x1, Buffer.from(reply, "utf8"))).catch(
-        () => {}
-      );
+      const message = opcode === 0x1 ? payload.toString("utf8") : payload;
+      if (session) {
+        await session.message?.(ws, message);
+      } else {
+        const label =
+          typeof message === "string" ? message : `[binary ${message.length}b]`;
+        await ws.send(`Echo: ${label}\n`).catch(() => {});
+      }
       continue;
     }
   }
+
+  await session?.close?.(ws);
 }
