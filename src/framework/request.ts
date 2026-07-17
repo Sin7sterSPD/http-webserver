@@ -3,6 +3,7 @@ import { HTTPError } from "../http_types.js";
 import { fieldGet } from "../http_parser.js";
 import type { RouteParams } from "../router.js";
 import { urlPathname } from "../file_server.js";
+import type { ParamsRecord } from "./types.js";
 
 export type QueryValue = string | string[];
 
@@ -10,7 +11,7 @@ export type QueryParams = Record<string, QueryValue>;
 
 export const DEFAULT_MAX_BUFFERED_BODY_BYTES = 1024 * 1024;
 
-export class AppRequest {
+export class AppRequest<Path extends string = string> {
   readonly raw: HTTPReq;
   readonly bodyReader: BodyReader;
 
@@ -47,12 +48,15 @@ export class AppRequest {
     return fieldGet(this.raw.headers, name)?.toString("latin1");
   }
 
-  param(name: string): string | undefined {
-    return this.routeParams[name];
+  /** Type-safe param access when Path is known. Falls back to string for unknown keys. */
+  param<K extends keyof ParamsRecord<Path>>(name: K): ParamsRecord<Path>[K] | undefined;
+  param(name: string): string | undefined;
+  param(name: string | keyof ParamsRecord<Path>): string | undefined {
+    return this.routeParams[name as string];
   }
 
-  params(): RouteParams {
-    return { ...this.routeParams };
+  params(): ParamsRecord<Path> {
+    return { ...this.routeParams } as ParamsRecord<Path>;
   }
 
   query(): QueryParams;

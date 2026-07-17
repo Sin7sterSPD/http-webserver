@@ -10,6 +10,9 @@ import { readerFromMemory } from "./body_readers.js";
 import { soRead, soWrite } from "./tcp.js";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_MAX_FRAME_SIZE = 16 * 1024 * 1024; // 16 MB max frame
+const WS_KEEPALIVE_INTERVAL_MS = 30000;
+const WS_KEEPALIVE_TIMEOUT_MS = 10000;
 
 export function isWebSocketUpgrade(req: HTTPReq): boolean {
   if (req.method !== "GET") return false;
@@ -29,20 +32,28 @@ export function computeSecWebSocketAccept(secKey: string): string {
     .digest("base64");
 }
 
-export function wsUpgradeResponse(accept: string): HTTPRes {
+export function wsUpgradeResponse(accept: string, protocol?: string): HTTPRes {
+  const headers = [
+    Buffer.from("Upgrade: websocket"),
+    Buffer.from("Connection: Upgrade"),
+    Buffer.from(`Sec-WebSocket-Accept: ${accept}`),
+  ];
+  if (protocol) {
+    headers.push(Buffer.from(`Sec-WebSocket-Protocol: ${protocol}`));
+  }
   return {
     code: 101,
-    headers: [
-      Buffer.from("Upgrade: websocket"),
-      Buffer.from("Connection: Upgrade"),
-      Buffer.from(`Sec-WebSocket-Accept: ${accept}`),
-    ],
+    headers,
     body: readerFromMemory(Buffer.from("")),
   };
 }
 
-export function encodeWsFrame(opcode: number, payload: Buffer): Buffer {
-  const fin = 0x80;
+export function encodeWsFrame(
+  opcode: number,
+  payload: Buffer,
+  opts?: { fin?: boolean; mask?: Buffer }
+): Buffer {
+  const fin = (opts?.fin ?? true) ? 0x80 : 0;
   const head0 = Buffer.from([fin | (opcode & 0xf)]);
   const plen = payload.length;
   let lenBytes: Buffer;
@@ -78,15 +89,19 @@ function take(buf: DynBuf, n: number): Buffer {
   return out;
 }
 
-async function readWsFrame(
-  conn: TCPConn,
-  buf: DynBuf
-): Promise<{ opcode: number; payload: Buffer }> {
+type WSFrame = {
+  opcode: number;
+  payload: Buffer;
+  fin: boolean;
+};
+
+async function readWsFrame(conn: TCPConn, buf: DynBuf): Promise<WSFrame> {
   await readAtLeast(conn, buf, 2);
   const b0 = buf.data[0]!;
   const b1 = buf.data[1]!;
   bufPop(buf, 2);
   const opcode = b0 & 0xf;
+  const fin = (b0 & 0x80) !== 0;
   const masked = (b1 & 0x80) !== 0;
   let len = b1 & 0x7f;
   if (len === 126) {
@@ -97,9 +112,10 @@ async function readWsFrame(
     await readAtLeast(conn, buf, 8);
     const big = buf.data.readBigUInt64BE(0);
     bufPop(buf, 8);
-    if (big > BigInt(16 * 1024 * 1024)) throw new Error("WS frame too large");
+    if (big > BigInt(WS_MAX_FRAME_SIZE)) throw new Error("WS frame too large");
     len = Number(big);
   }
+  if (len > WS_MAX_FRAME_SIZE) throw new Error("WS frame too large");
   let mask = Buffer.alloc(4);
   if (masked) {
     await readAtLeast(conn, buf, 4);
@@ -115,7 +131,47 @@ async function readWsFrame(
       payload[i] = bi ^ mi;
     }
   }
-  return { opcode, payload };
+  return { opcode, payload, fin };
+}
+
+/** Read a complete WebSocket message, handling fragmentation. */
+async function readWsMessage(
+  conn: TCPConn,
+  buf: DynBuf
+): Promise<{ opcode: number; payload: Buffer } | null> {
+  const fragments: Buffer[] = [];
+  let messageOpcode = 0;
+
+  while (true) {
+    const frame = await readWsFrame(conn, buf);
+    const { opcode, payload, fin } = frame;
+
+    // Control frames can appear between data fragments — handle immediately
+    if (opcode === 0x8) {
+      return { opcode, payload };
+    }
+    if (opcode === 0x9) {
+      return { opcode, payload };
+    }
+    if (opcode === 0xa) {
+      return { opcode, payload };
+    }
+
+    if (opcode === 0x0) {
+      // continuation
+      fragments.push(payload);
+    } else if (opcode === 0x1 || opcode === 0x2) {
+      messageOpcode = opcode;
+      fragments.push(payload);
+    } else {
+      throw new Error(`Unknown WS opcode: ${opcode}`);
+    }
+
+    if (fin) break;
+  }
+
+  const full = Buffer.concat(fragments);
+  return { opcode: messageOpcode, payload: full };
 }
 
 function createWebSocketConnection(conn: TCPConn): WebSocketConnection {
@@ -124,6 +180,9 @@ function createWebSocketConnection(conn: TCPConn): WebSocketConnection {
       const payload = typeof data === "string" ? Buffer.from(data, "utf8") : data;
       const opcode = typeof data === "string" ? 0x1 : 0x2;
       await soWrite(conn, encodeWsFrame(opcode, payload));
+    },
+    ping: async () => {
+      await soWrite(conn, encodeWsFrame(0x9, Buffer.alloc(0)));
     },
     close: async () => {
       await soWrite(conn, encodeWsFrame(0x8, Buffer.alloc(0))).catch(() => {});
@@ -138,42 +197,77 @@ export async function runWebSocketSession(
 ): Promise<void> {
   const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
   const ws = createWebSocketConnection(conn);
+  let lastPong = Date.now();
+  let closed = false;
 
-  if (session) {
-    await session.open?.(ws);
-  } else {
-    await ws.send("Welcome! Send text; server echoes.\n");
-  }
+  // Keepalive ping/pong
+  const pingTimer = setInterval(() => {
+    if (closed) return;
+    if (Date.now() - lastPong > WS_KEEPALIVE_TIMEOUT_MS + WS_KEEPALIVE_INTERVAL_MS) {
+      ws.close().catch(() => {});
+      return;
+    }
+    ws.ping().catch(() => {});
+  }, WS_KEEPALIVE_INTERVAL_MS);
 
-  while (true) {
-    let frame: { opcode: number; payload: Buffer };
-    try {
-      frame = await readWsFrame(conn, buf);
-    } catch {
-      break;
+  const cleanup = () => {
+    closed = true;
+    clearInterval(pingTimer);
+  };
+
+  try {
+    if (session) {
+      await session.open?.(ws);
+    } else {
+      await ws.send("Welcome! Send text; server echoes.\n");
     }
-    const { opcode, payload } = frame;
-    if (opcode === 0x8) {
-      await soWrite(conn, encodeWsFrame(0x8, Buffer.alloc(0))).catch(() => {});
-      break;
-    }
-    if (opcode === 0x9) {
-      await soWrite(conn, encodeWsFrame(0xa, payload)).catch(() => {});
-      continue;
-    }
-    if (opcode === 0xa) continue;
-    if (opcode === 0x1 || opcode === 0x2) {
-      const message = opcode === 0x1 ? payload.toString("utf8") : payload;
-      if (session) {
-        await session.message?.(ws, message);
-      } else {
-        const label =
-          typeof message === "string" ? message : `[binary ${message.length}b]`;
-        await ws.send(`Echo: ${label}\n`).catch(() => {});
+
+    while (!closed) {
+      let msg: { opcode: number; payload: Buffer } | null;
+      try {
+        msg = await readWsMessage(conn, buf);
+      } catch {
+        break;
       }
-      continue;
-    }
-  }
+      if (!msg) continue;
 
-  await session?.close?.(ws);
+      const { opcode, payload } = msg;
+      if (opcode === 0x8) {
+        await soWrite(conn, encodeWsFrame(0x8, Buffer.alloc(0))).catch(() => {});
+        break;
+      }
+      if (opcode === 0x9) {
+        // ping — send pong
+        await soWrite(conn, encodeWsFrame(0xa, payload)).catch(() => {});
+        continue;
+      }
+      if (opcode === 0xa) {
+        // pong
+        lastPong = Date.now();
+        continue;
+      }
+      if (opcode === 0x1 || opcode === 0x2) {
+        const message = opcode === 0x1 ? payload.toString("utf8") : payload;
+        if (session) {
+          await session.message?.(ws, message);
+        } else {
+          const label =
+            typeof message === "string" ? message : `[binary ${message.length}b]`;
+          await ws.send(`Echo: ${label}\n`).catch(() => {});
+        }
+        continue;
+      }
+    }
+
+    await session?.close?.(ws);
+  } finally {
+    cleanup();
+  }
+}
+
+/** Extract client-offered subprotocols from the request. */
+export function getClientProtocols(req: HTTPReq): string[] {
+  const raw = fieldGet(req.headers, "Sec-WebSocket-Protocol")?.toString("latin1");
+  if (!raw) return [];
+  return raw.split(",").map((p) => p.trim()).filter(Boolean);
 }

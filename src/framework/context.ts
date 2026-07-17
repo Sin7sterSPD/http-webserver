@@ -1,6 +1,7 @@
 import type { BodyReader, HTTPReq, HTTPRes } from "../http_types.js";
 import { readerFromMemory } from "../body_readers.js";
 import type { RouteParams } from "../router.js";
+import type { ParamsRecord } from "./types.js";
 import { AppRequest } from "./request.js";
 import type {
   ContextResponseInit,
@@ -38,8 +39,8 @@ type HeaderStoreValue = {
   value: string;
 };
 
-export class Context {
-  readonly req: AppRequest;
+export class Context<Path extends string = string> {
+  readonly req: AppRequest<Path>;
   readonly clientIp: string;
 
   response: HTTPRes | null = null;
@@ -49,11 +50,25 @@ export class Context {
   private readonly headerStore = new Map<string, HeaderStoreValue>();
   private readonly validated = new Map<ValidationTarget, unknown>();
   private websocketRouteSession: WebSocketRouteSession | null = null;
+  private variableStore = new Map<string, unknown>();
 
   constructor(req: HTTPReq, body: BodyReader, params: RouteParams, clientIp: string) {
-    this.req = new AppRequest(req, body, params);
+    this.req = new AppRequest(req, body, params) as AppRequest<Path>;
     this.clientIp = clientIp;
     this.header("Server", "http-web-server");
+    // Security headers by default
+    this.header("X-Content-Type-Options", "nosniff");
+    this.header("X-Frame-Options", "DENY");
+    this.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  }
+
+  /** Get or set a context variable (useful for middleware passing data). */
+  get<T = unknown>(key: string): T | undefined {
+    return this.variableStore.get(key) as T | undefined;
+  }
+
+  set<T = unknown>(key: string, value: T): void {
+    this.variableStore.set(key, value);
   }
 
   status(code: number): this {
@@ -108,6 +123,14 @@ export class Context {
     return this.body(data, {
       ...init,
       contentType: init.contentType ?? "text/html; charset=utf-8",
+    });
+  }
+
+  redirect(location: string, status = 302): HTTPRes {
+    return this.body("", {
+      status,
+      headers: { Location: location },
+      contentType: "text/plain; charset=utf-8",
     });
   }
 

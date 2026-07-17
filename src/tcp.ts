@@ -41,8 +41,28 @@ export function soRead(conn: TCPConn): Promise<Buffer> {
 
 export function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
-    conn.socket.write(data, (err?: Error | null) =>
+    const ok = conn.socket.write(data, (err?: Error | null) =>
       err ? reject(err) : resolve()
     );
+    if (!ok) {
+      // Backpressure: wait for drain before resolving
+      conn.socket.once("drain", () => resolve());
+    }
   });
+}
+
+/** Set up socket with production timeouts and limits. */
+export function configureSocket(
+  socket: net.Socket,
+  opts: {
+    idleTimeoutMs?: number;
+    keepAlive?: boolean;
+    keepAliveInitialDelayMs?: number;
+  } = {}
+): void {
+  const idleTimeoutMs = opts.idleTimeoutMs ?? 30000;
+  socket.setTimeout(idleTimeoutMs);
+  if (opts.keepAlive !== false) {
+    socket.setKeepAlive(true, opts.keepAliveInitialDelayMs ?? 5000);
+  }
 }

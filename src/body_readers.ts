@@ -1,7 +1,116 @@
 import fs from "node:fs/promises";
 import type { BodyReader, DynBuf, TCPConn } from "./http_types.js";
+import { HTTPError } from "./http_types.js";
 import { bufPop, bufPush } from "./buffer.js";
 import { soRead } from "./tcp.js";
+
+const MAX_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB per chunk
+const MAX_TOTAL_BODY_SIZE = 100 * 1024 * 1024; // 100 MB total
+
+/** Read until we have at least `n` bytes in the buffer. */
+async function readAtLeast(conn: TCPConn, buf: DynBuf, n: number): Promise<void> {
+  while (buf.length < n) {
+    const data = await soRead(conn);
+    if (data.length === 0) throw new HTTPError(400, "Unexpected EOF reading body");
+    bufPush(buf, data);
+  }
+}
+
+/** Find a CRLF sequence in the buffer, return its index or -1. */
+function findCRLF(buf: DynBuf): number {
+  for (let i = 0; i < buf.length - 1; i++) {
+    if (buf.data[i] === 0x0d && buf.data[i + 1] === 0x0a) return i;
+  }
+  return -1;
+}
+
+/** Read a line terminated by CRLF from the buffered connection. */
+async function readLine(conn: TCPConn, buf: DynBuf): Promise<Buffer> {
+  while (true) {
+    const idx = findCRLF(buf);
+    if (idx >= 0) {
+      const line = Buffer.from(buf.data.subarray(0, idx));
+      bufPop(buf, idx + 2); // remove line + \r\n
+      return line;
+    }
+    const data = await soRead(conn);
+    if (data.length === 0) throw new HTTPError(400, "Unexpected EOF reading chunked body");
+    bufPush(buf, data);
+  }
+}
+
+/** Consume exactly \r\n from the buffer. */
+async function readCRLF(conn: TCPConn, buf: DynBuf): Promise<void> {
+  await readAtLeast(conn, buf, 2);
+  if (buf.data[0] !== 0x0d || buf.data[1] !== 0x0a) {
+    throw new HTTPError(400, "Expected CRLF in chunked body");
+  }
+  bufPop(buf, 2);
+}
+
+/** Skip trailer headers after the final chunk. */
+async function skipTrailers(conn: TCPConn, buf: DynBuf): Promise<void> {
+  while (true) {
+    const line = await readLine(conn, buf);
+    if (line.length === 0) return; // empty line marks end of trailers
+  }
+}
+
+export function readerFromChunkedConn(conn: TCPConn, buf: DynBuf): BodyReader {
+  let done = false;
+  let currentChunkRemain = 0;
+  let inChunkData = false;
+  let totalBytesRead = 0;
+
+  const readChunk = async (): Promise<Buffer> => {
+    if (done) return Buffer.from("");
+
+    // Drain remaining chunk data
+    if (inChunkData && currentChunkRemain > 0) {
+      const avail = Math.min(buf.length, currentChunkRemain);
+      if (avail === 0) {
+        await readAtLeast(conn, buf, 1);
+        return readChunk();
+      }
+      const out = Buffer.from(buf.data.subarray(0, avail));
+      bufPop(buf, avail);
+      currentChunkRemain -= avail;
+      if (currentChunkRemain === 0) {
+        inChunkData = false;
+        await readCRLF(conn, buf);
+      }
+      totalBytesRead += out.length;
+      if (totalBytesRead > MAX_TOTAL_BODY_SIZE) {
+        throw new HTTPError(413, "Request body too large");
+      }
+      return out;
+    }
+
+    // Read next chunk size line
+    if (!done && !inChunkData) {
+      const line = await readLine(conn, buf);
+      const sizeHex = line.toString("latin1").split(";")[0]?.trim() ?? "0";
+      const size = parseInt(sizeHex, 16);
+      if (isNaN(size)) throw new HTTPError(400, "Invalid chunk size");
+      if (size > MAX_CHUNK_SIZE) throw new HTTPError(413, "Chunk too large");
+      if (size === 0) {
+        await skipTrailers(conn, buf);
+        done = true;
+        return Buffer.from("");
+      }
+      currentChunkRemain = size;
+      inChunkData = true;
+      return readChunk();
+    }
+
+    return Buffer.from("");
+  };
+
+  return {
+    length: -1, // unknown total length
+    read: readChunk,
+  };
+}
 
 export function readerFromMemory(data: Buffer): BodyReader {
   let done = false;

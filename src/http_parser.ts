@@ -2,6 +2,7 @@ import type { BodyReader, DynBuf, HTTPReq, TCPConn } from "./http_types.js";
 import { HTTPError } from "./http_types.js";
 import { bufPop } from "./buffer.js";
 import {
+  readerFromChunkedConn,
   readerFromConnLength,
   readerFromMemory,
 } from "./body_readers.js";
@@ -91,14 +92,14 @@ export function readerFromReq(
 
   if (!bodyAllowed) return readerFromMemory(Buffer.from(""));
 
+  if (chunked) {
+    return readerFromChunkedConn(conn, buf);
+  }
+
   if (contentLen) {
     const bodyLen = parseInt(contentLen.toString("latin1"), 10);
     if (isNaN(bodyLen)) throw new HTTPError(400, "Bad Content-Length");
     return readerFromConnLength(conn, buf, bodyLen);
-  }
-
-  if (chunked) {
-    return readerFromMemory(Buffer.from(""));
   }
 
   return readerFromMemory(Buffer.from(""));
